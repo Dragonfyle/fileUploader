@@ -1,5 +1,6 @@
 setlocal
 cd /d %~dp0
-call ts-node "%~dp0upload.ts" %1
+@REM call ts-node "%~dp0upload.ts" %1
+call npm run ts-node %1
 endlocal
 
