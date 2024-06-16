@@ -13,7 +13,7 @@
   "main": "upload.ts",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "ts-node": "ts-node upload.ts"
+    "ts-node": "npx ts-node upload.ts"
   },
   "author": "",
   "license": "ISC",
