@@ -4,35 +4,39 @@ import fs from "fs/promises";
 import path from "path";
 import readline, { Key, clearLine, moveCursor } from "readline";
 import { Transform } from "stream";
+import { WriteStream } from "fs";
 
 const PROTOCOL = {
   KEYWORDS: {
-    WAITING_FOR_OTHER_SOCKET: "wfos",
-    PASSWORD: "pswd",
-    PASSWORD_ERROR: "pswd-err",
-    CONNECTED: "cnctd",
-    DISCONNECTED: "dcnctd",
-    WAITING_FOR_FILE_NAME: "wffn",
-    WAITING_FOR_FILE_CONTENTS: "wffc",
-    FILE_NAME: "fnm",
-    FILE_CONTENTS: "fct",
+    WAITING_FOR_PASSWORD: 1,
+    PASSWORD: 2,
+    PASSWORD_ERROR: 3,
+    WAITING_FOR_OTHER_SOCKET: 4,
+    DISCONNECTED: 5,
+    WAITING_FOR_FILE_NAME: 6,
+    WAITING_FOR_FILE_CONTENTS: 7,
+    FILE_NAME: 8,
+    FILE_CONTENTS: 9,
   },
 } as const;
 
+const KEYWORD_BYTES = 1;
+const MESSAGE_LENGTH_BYTES = 4;
+const FRAME_BYTES = KEYWORD_BYTES + MESSAGE_LENGTH_BYTES;
+
 type Keyword = (typeof PROTOCOL.KEYWORDS)[keyof typeof PROTOCOL.KEYWORDS];
-type KeywordQueue = Keyword[];
 
 type Packet = {
-  keywords: KeywordQueue;
-  payload?: any;
+  keyword: Keyword;
+  payload: any;
+  EOF: boolean;
 };
 
-const NULL_BYTE = 0x00;
-
-function createPacket(keywords: KeywordQueue, payload?: any) {
+function createPacket(keyword: Keyword, payload: any = [], EOF = false) {
   const packet = {
-    keywords,
+    keyword,
     payload,
+    EOF,
   };
 
   return JSON.stringify(packet);
@@ -46,7 +50,6 @@ const socket = net.createConnection(port, ip, () => {
 });
 
 let sourcePath: string;
-let fileName;
 
 function showWaitingForOtherSocket() {
   // process.stdin.pause();
@@ -84,41 +87,49 @@ let rl = readline.createInterface({
 });
 
 let isConnected = false;
-let buffer = "";
-const keywordQueue: KeywordQueue = [];
+let isPipingContents = false;
+
+const dataBuffer = new Map<Keyword, string>();
+let fileWriteStream: WriteStream;
+
+let filename: string;
+let currentKeyword: Keyword | null = null;
+let messageLength: number = 0;
+let bytesRead = 0;
+let buffer = Buffer.alloc(0);
 
 socket.on("data", async (data) => {
-  buffer += data.toString();
-  console.log(buffer.toString());
+  buffer = Buffer.concat([buffer, data]);
 
-  if (data[data.length - 1] !== NULL_BYTE) return;
+  do {
+    let payload: Buffer;
+    if (!currentKeyword) {
+      currentKeyword = buffer.readUint8() as Keyword;
+      messageLength = buffer.readUInt32BE(KEYWORD_BYTES);
+      payload = buffer.subarray(FRAME_BYTES, FRAME_BYTES + messageLength);
+    } else {
+      payload = buffer;
+    }
 
-  buffer = buffer.slice(0, -1);
-  const dataParsed: Packet = JSON.parse(buffer);
-  console.log(dataParsed);
-  const keywords = dataParsed.keywords;
-  const payload = dataParsed.payload;
+    bytesRead += data.length;
+    buffer = buffer.subarray(FRAME_BYTES + messageLength);
 
-  buffer = "";
-
-  for (const keyword of keywords) {
-    if (keyword === PROTOCOL.KEYWORDS.PASSWORD) {
+    if (currentKeyword === PROTOCOL.KEYWORDS.WAITING_FOR_PASSWORD) {
       rl.question("Enter password: ", (password) => {
-        socket.write(createPacket([PROTOCOL.KEYWORDS.PASSWORD], password));
-        socket.write(Buffer.from([NULL_BYTE]));
+        handleOutboundPswd(socket, password);
       });
-    } else if (keyword === PROTOCOL.KEYWORDS.PASSWORD_ERROR) {
+    } else if (currentKeyword === PROTOCOL.KEYWORDS.PASSWORD_ERROR) {
       console.log("\nPassword incorrect");
-    } else if (keyword === PROTOCOL.KEYWORDS.DISCONNECTED) {
-      console.log("The other client disconnected.");
-    } else if (keyword === PROTOCOL.KEYWORDS.WAITING_FOR_OTHER_SOCKET) {
+    } else if (currentKeyword === PROTOCOL.KEYWORDS.DISCONNECTED) {
+      console.log("\nThe other client disconnected.");
+    } else if (currentKeyword === PROTOCOL.KEYWORDS.WAITING_FOR_OTHER_SOCKET) {
       if (!isConnected) {
         console.log("\nConnected to server");
       }
       isConnected = true;
 
       intervalUnsubscribe = showWaitingForOtherSocket();
-    } else if (keyword === PROTOCOL.KEYWORDS.WAITING_FOR_FILE_NAME) {
+    } else if (currentKeyword === PROTOCOL.KEYWORDS.WAITING_FOR_FILE_NAME) {
       if (!isConnected) {
         console.log("\nConnected to server");
       }
@@ -132,23 +143,35 @@ socket.on("data", async (data) => {
 
       rl.question("Enter file path: ", async (filePath) => {
         sourcePath = filePath;
-        fileName = path.basename(filePath);
+        const fileName = path.basename(filePath);
 
-        const fileNamePacket = createPacket(
-          [PROTOCOL.KEYWORDS.FILE_NAME],
-          fileName
+        const messageBuffer = makeMessage(
+          PROTOCOL.KEYWORDS.FILE_NAME,
+          Buffer.from(fileName)
         );
 
-        socket.write(fileNamePacket);
-        socket.write(Buffer.from([NULL_BYTE]));
+        socket.write(messageBuffer);
       });
-    } else if (keyword === PROTOCOL.KEYWORDS.FILE_CONTENTS) {
-      const fileHandle = await fs.open("./downloads/file.txt", "w");
-      const writeStream = fileHandle.createWriteStream();
-      const buffer = Buffer.from(payload.data);
-      writeStream.write(buffer, () => fileHandle.close());
+    } else if (currentKeyword === PROTOCOL.KEYWORDS.FILE_CONTENTS) {
+      console.log("writing");
+      fileWriteStream.write(payload);
+      // const fileHandle = await fs.open("./downloads/file.txt", "w");
+      // const writeStream = fileHandle.createWriteStream();
+      //
+      // writeStream.write(payload, () => fileHandle.close());
+    } else if (currentKeyword === PROTOCOL.KEYWORDS.FILE_NAME) {
+      console.log(`\nReceiving file: ${payload.toString()}`);
+      const fileName = payload.toString();
+      // const fileName = packet;
+      fs.open(`./downloads/${fileName}`, "w").then((fileHandle) => {
+        fileWriteStream = fileHandle.createWriteStream();
+      });
+      // const fileHandle = await fs.open("./downloads/file.txt", "w");
+      // const writeStream = fileHandle.createWriteStream();
+      //
+      // writeStream.write(payload, () => fileHandle.close());
     } else if (
-      keyword === PROTOCOL.KEYWORDS.WAITING_FOR_FILE_CONTENTS &&
+      currentKeyword === PROTOCOL.KEYWORDS.WAITING_FOR_FILE_CONTENTS &&
       sourcePath
     ) {
       let fileHandle;
@@ -158,53 +181,64 @@ socket.on("data", async (data) => {
 
         const transformStream = new Transform({
           transform(chunk, encoding, callback) {
-            const wrappedChunk = createPacket(
-              [PROTOCOL.KEYWORDS.FILE_CONTENTS],
-              chunk
-            );
-            callback(null, wrappedChunk);
+            this.push(makeMessage(PROTOCOL.KEYWORDS.FILE_CONTENTS, chunk));
+
+            callback();
           },
         });
 
-        const fileReadStream = fileHandle.createReadStream();
-
-        fileReadStream.pipe(transformStream).pipe(socket, { end: false });
-        fileReadStream.on("end", () => {
-          socket.write(Buffer.from([NULL_BYTE]));
+        const fileReadStream = fileHandle.createReadStream({
+          highWaterMark: 16 * 1024,
         });
+
+        const fileSize = (await fileHandle.stat()).size;
+
+        socket.write(makeMessage(PROTOCOL.KEYWORDS.FILE_CONTENTS, fileSize));
+        fileReadStream.pipe(socket, { end: false });
       } catch (error) {
-        console.log(`Error while opening file: ${sourcePath}`);
+        console.log(`Error while reading file: ${sourcePath}`);
       }
     }
-  }
+
+    if (bytesRead === messageLength) {
+      currentKeyword = null;
+      messageLength = 0;
+      bytesRead = 0;
+    }
+  } while (buffer.length > FRAME_BYTES + messageLength);
 });
 
-let pathBuffer = "";
+function handleOutboundPswd(socket: net.Socket, password: string) {
+  const messageBuffer = makeMessage(
+    PROTOCOL.KEYWORDS.PASSWORD,
+    Buffer.from(password)
+  );
 
-// process.stdin.on("data", async (data) => {
-// if (isConnected) {
-// pathBuffer += data.toString();
-//
-// fileReadStream.on("end", () => {
-// console.log("File sent successfully");
-// fileHandle.close();
-// });
-// }
-// }
-// } else {
-// }
-// });
+  socket.write(messageBuffer);
+}
 
-// process.stdin.on("data", (data) => {
-// data.p;
-//
-//
-//
-// if (!socket.write(data)) {
-// process.stdin.pause();
-// }
-//
-// process.stdin.on("drain", () => {
-// process.stdin.resume();
-// });
-// });
+function makeFrame(keyword: Keyword, messageLength: number) {
+  const buffer = Buffer.alloc(FRAME_BYTES);
+
+  buffer.writeUInt8(keyword);
+  buffer.writeUInt32BE(messageLength, KEYWORD_BYTES);
+
+  return buffer;
+}
+
+function makeMessage(keyword: Keyword, message?: Buffer): Buffer;
+function makeMessage(keyword: Keyword, messageSize?: number): Buffer;
+
+function makeMessage(keyword: Keyword, messageOrSize?: Buffer | number) {
+  const payloadSize =
+    messageOrSize instanceof Buffer ? messageOrSize.length : messageOrSize || 0;
+
+  const messageLength = FRAME_BYTES + payloadSize;
+  const messageBuffer = makeFrame(keyword, messageLength);
+
+  if (messageOrSize instanceof Buffer) {
+    return Buffer.concat([messageBuffer, messageOrSize]);
+  }
+
+  return messageBuffer;
+}
